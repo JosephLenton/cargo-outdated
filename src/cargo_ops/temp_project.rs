@@ -16,11 +16,12 @@ use cargo::{
         config::SourceConfigMap,
         source::{QueryKind, Source},
     },
-    util::{cache_lock::CacheLockMode, network::PollExt, CargoResult, Config},
+    util::{cache_lock::CacheLockMode, network::PollExt, CargoResult},
 };
 use semver::{Version, VersionReq};
 use tempfile::{Builder, TempDir};
 use toml::{value::Table, Value};
+use cargo::util::context::GlobalContext;
 
 use super::{ElaborateWorkspace, Manifest};
 use crate::{error::OutdatedError, Options};
@@ -30,7 +31,7 @@ pub struct TempProject<'tmp> {
     pub workspace: Rc<RefCell<Option<Workspace<'tmp>>>>,
     pub temp_dir: TempDir,
     manifest_paths: Vec<PathBuf>,
-    config: Config,
+    config: GlobalContext,
     relative_manifest: String,
     options: &'tmp Options,
     is_workspace_project: bool,
@@ -173,7 +174,7 @@ impl<'tmp> TempProject<'tmp> {
         root: &Path,
         relative_manifest: &str,
         options: &Options,
-    ) -> CargoResult<Config> {
+    ) -> CargoResult<GlobalContext> {
         let shell = ::cargo::core::Shell::new();
         let cwd = env::current_dir()
             .with_context(|| "Cargo couldn't get the current directory of the process")?;
@@ -191,7 +192,7 @@ impl<'tmp> TempProject<'tmp> {
         // if it is, set it in the configure options
         let cargo_home_path = std::env::var_os("CARGO_HOME").map(std::path::PathBuf::from);
 
-        let mut config = Config::new(shell, cwd, homedir);
+        let mut config = GlobalContext::new(shell, cwd, homedir);
         config.configure(
             0,
             options.verbose == 0,
@@ -212,7 +213,7 @@ impl<'tmp> TempProject<'tmp> {
             recursive: false,
             precise: None,
             to_update: Vec::new(),
-            config: &self.config,
+            gctx: &self.config,
             dry_run: false,
             workspace: self.is_workspace_project,
         };
@@ -390,7 +391,7 @@ impl<'tmp> TempProject<'tmp> {
         let version = package_id.version();
         let source_id = package_id.source_id().with_locked_precise();
         let query_result = {
-            let ws_config = workspace.workspace.config();
+            let ws_config = workspace.workspace.gctx();
             let _lock = ws_config.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
             let source_config = SourceConfigMap::new(ws_config)?;
             let mut source = source_config.load(source_id, &HashSet::new())?;
@@ -402,7 +403,7 @@ impl<'tmp> TempProject<'tmp> {
             let mut query_result = source
                 .query_vec(&dependency, QueryKind::Exact)?
                 .expect("Source should be ready");
-            query_result.sort_by(|a, b| b.version().cmp(a.version()));
+            query_result.sort_by(|a, b| b.as_summary().version().cmp(a.as_summary().version()));
             query_result
         };
         let version_req = match requirement {
@@ -410,7 +411,7 @@ impl<'tmp> TempProject<'tmp> {
             None => None,
         };
         let latest_result = query_result.iter().find(|summary| {
-            if summary.version() < version {
+            if summary.as_summary().version() < version {
                 false
             } else if version_req.is_none() {
                 true
@@ -418,10 +419,10 @@ impl<'tmp> TempProject<'tmp> {
                 // this unwrap is safe since we check if `version_req` is `None` before this
                 // (which is only `None` if `requirement` is `None`)
                 self.options.aggressive
-                    || valid_latest_version(requirement.unwrap(), summary.version())
+                    || valid_latest_version(requirement.unwrap(), summary.as_summary().version())
             } else {
                 // this unwrap is safe since we check if `version_req` is `None` before this
-                version_req.as_ref().unwrap().matches(summary.version())
+                version_req.as_ref().unwrap().matches(summary.as_summary().version())
             }
         });
 
@@ -443,7 +444,7 @@ impl<'tmp> TempProject<'tmp> {
                     "cannot compare {} crate version found in toml {} with crates.io latest {}",
                     name,
                     ver_req,
-                    query_result[0].version()
+                    query_result[0].as_summary().version()
                 ))?;
 
                 // this returns the latest version
@@ -451,7 +452,7 @@ impl<'tmp> TempProject<'tmp> {
             }
         };
 
-        Ok(latest_summary.clone())
+        Ok(latest_summary.as_summary().clone())
     }
 
     fn feature_includes(&self, name: &str, optional: bool, features_table: &Option<Value>) -> bool {
